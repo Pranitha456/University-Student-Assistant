@@ -28,6 +28,9 @@ import os
 
 APP = Flask(__name__)
 CORS(APP)
+from flask import Flask
+app = Flask(__name__)
+
 
 DATA_FILE = "data_store.json"
 LOCK = threading.Lock()
