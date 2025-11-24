@@ -1,347 +1,405 @@
-from flask import Flask, request, jsonify, send_file
+"""
+University Student Helpdesk - Single-file Flask Mock API
+
+Features implemented (mock/in-memory with optional JSON persistence):
+- Fees lookup and payment link generation
+- Course enrollment and waitlist
+- Exam timetable and special arrangements
+- Hostel availability, booking and maintenance tickets
+- Leave applications with auto-approve rules
+- Event registration and waitlist
+- Identity verification (OTP simulation)
+- Simple audit logging & ticketing
+
+Run:
+    pip install flask flask_cors
+    python university_helpdesk_api.py
+
+The app stores runtime state in `data_store.json` for convenience (ignored by git by default).
+"""
+
+from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
-from datetime import datetime, timedelta
 import uuid
+import datetime
+import json
+import threading
+import os
 
-app = Flask(__name__)
-CORS(app)
+APP = Flask(__name__)
+CORS(APP)
 
-# -------------------------
-# Mock in-memory data stores
-# -------------------------
-students = {
-    "S1001": {"name": "Alice", "phone": "+111111", "email": "alice@example.edu", "holds": [], "program": "BScCS"},
-    "S1002": {"name": "Bob", "phone": "+222222", "email": "bob@example.edu", "holds": ["finance"], "program": "BA"},
-}
+DATA_FILE = "data_store.json"
+LOCK = threading.Lock()
 
-fees = {
-    "S1001": {"dueAmount": 150.00, "lastPaymentDate": "2025-02-01", "receipts": ["https://example.edu/receipt/1001/1"]},
-    # S1002 intentionally missing to test 'no record' path
-}
+# ---------------- Utilities ----------------
+def now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-courses = {
-    "CS101": {"seats_total": 2, "seats_filled": 1, "prereqs": []},
-    "CS201": {"seats_total": 1, "seats_filled": 1, "prereqs": ["CS101"]},
-}
-
-enrollments = {}   # key: studentId -> [courseCodes]
-waitlists = {}     # key: courseCode -> [studentId]
-
-exams = {
-    "S1001": [
-        {"course": "CS101", "date": "2025-06-01", "time": "10:00", "venue": "Hall A"},
-        {"course": "MATH101", "date": "2025-06-03", "time": "14:00", "venue": "Hall B"},
-    ]
-}
-
-hostel_rooms = [
-    {"block": "A", "room": "A101", "available": True},
-    {"block": "A", "room": "A102", "available": False},
-    {"block": "B", "room": "B201", "available": True},
-]
-
-tickets = []   # generic ticket store
-events = {
-    "EVT100": {"name": "Tech Fest", "capacity": 2, "participants": [] , "waitlist": []},
-    "EVT101": {"name": "Art Expo", "capacity": 1, "participants": [] , "waitlist": []},
-}
-
-leaves = []
-audit_logs = []
-
-# Path to uploaded flow image (from session)
-FLOW_IMAGE_PATH = "/mnt/data/fe233be5-ad0b-4a79-8498-22629ef3317f.png"
-
-# -------------------------
-# Utility helpers
-# -------------------------
-def log_audit(action, payload):
-    entry = {"id": str(uuid.uuid4()), "action": action, "payload": payload, "ts": datetime.utcnow().isoformat()}
-    audit_logs.append(entry)
-
-def make_ticket(studentId, category, subcategory, details, priority="normal"):
-    ticket = {
-        "ticket_id": str(uuid.uuid4()),
-        "studentId": studentId,
-        "category": category,
-        "subcategory": subcategory,
-        "details": details,
-        "priority": priority,
-        "createdAt": datetime.utcnow().isoformat(),
-        "status": "open"
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # defaults
+    return {
+        "students": {},
+        "courses": {},
+        "enrollments": {},
+        "waitlists": {},
+        "fees": {},
+        "payments": {},
+        "exam_timetables": {},
+        "exam_special_requests": {},
+        "hostels": {},
+        "hostel_bookings": {},
+        "maintenance_tickets": {},
+        "leave_requests": {},
+        "events": {},
+        "event_registrations": {},
+        "event_waitlists": {},
+        "otps": {},
+        "audit_logs": []
     }
-    tickets.append(ticket)
-    log_audit("create_ticket", ticket)
-    return ticket
 
-# -------------------------
-# Endpoints
-# -------------------------
+def save_data(data):
+    with LOCK:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
 
-@app.route("/")
-def index():
-    return jsonify({"message": "University Helpdesk API - running", "version": "1.0"})
+def audit(user, action, details=None):
+    entry = {
+        "id": str(uuid.uuid4()),
+        "time": now_iso(),
+        "user": user,
+        "action": action,
+        "details": details or {}
+    }
+    DATA["audit_logs"].append(entry)
+    save_data(DATA)
 
-# ---------- Fees ----------
-@app.route("/fees/<studentId>", methods=["GET"])
-def get_fees(studentId):
-    log_audit("get_fees", {"studentId": studentId})
-    rec = fees.get(studentId)
-    if rec:
-        return jsonify({"found": True, "studentId": studentId, **rec})
+# ---------------- Initialize data ----------------
+DATA = load_data()
+
+# seed some data if empty
+if not DATA["students"]:
+    DATA["students"] = {
+        "s001": {"id": "s001", "name": "Alice Example", "email": "alice@example.edu"},
+        "s002": {"id": "s002", "name": "Bob Example", "email": "bob@example.edu"}
+    }
+
+if not DATA["courses"]:
+    DATA["courses"] = {
+        "CSE101": {"code": "CSE101", "title": "Intro to Computer Science", "capacity": 2},
+        "MTH101": {"code": "MTH101", "title": "Calculus I", "capacity": 1}
+    }
+
+if not DATA["fees"]:
+    DATA["fees"] = {
+        "s001": {"balance": 1500.0, "items": [{"desc": "Tuition", "amount": 1500.0}]},
+        "s002": {"balance": 0.0, "items": []}
+    }
+
+if not DATA["exam_timetables"]:
+    DATA["exam_timetables"] = {
+        "CSE101": [{"date": "2026-01-15", "time": "09:00", "venue": "Hall A"}],
+        "MTH101": [{"date": "2026-01-17", "time": "13:00", "venue": "Hall B"}]
+    }
+
+if not DATA["hostels"]:
+    DATA["hostels"] = {
+        "H1": {"name": "Maple Hostel", "rooms_total": 4, "rooms_available": 2},
+        "H2": {"name": "Pine Hostel", "rooms_total": 3, "rooms_available": 3}
+    }
+
+if not DATA["events"]:
+    DATA["events"] = {
+        "EVT100": {"id": "EVT100", "title": "Freshers Meet", "capacity": 2}
+    }
+
+save_data(DATA)
+
+# ---------------- Fees endpoints ----------------
+@APP.route("/fees/<student_id>", methods=["GET"])
+def get_fees(student_id):
+    fees = DATA["fees"].get(student_id, {"balance": 0.0, "items": []})
+    audit(student_id, "check_fees")
+    return jsonify({"student_id": student_id, **fees})
+
+@APP.route("/fees/pay/<student_id>", methods=["POST"])
+def create_payment(student_id):
+    body = request.json or {}
+    amount = body.get("amount")
+    if amount is None:
+        abort(400, "amount required")
+    token = str(uuid.uuid4())
+    payment = {
+        "id": token,
+        "student_id": student_id,
+        "amount": float(amount),
+        "created": now_iso(),
+        "status": "pending",
+        "expires_at": (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).replace(microsecond=0).isoformat() + "Z"
+    }
+    DATA["payments"][token] = payment
+    save_data(DATA)
+    audit(student_id, "generate_payment", {"payment_id": token, "amount": amount})
+    # mock payment link
+    link = f"https://payments.example/university/pay/{token}"
+    return jsonify({"payment_id": token, "payment_link": link, "expires_at": payment["expires_at"]})
+
+@APP.route("/fees/pay/callback/<payment_id>", methods=["POST"])
+def payment_callback(payment_id):
+    payment = DATA["payments"].get(payment_id)
+    if not payment:
+        abort(404)
+    payment["status"] = "completed"
+    payment["completed_at"] = now_iso()
+    sid = payment["student_id"]
+    if sid in DATA["fees"]:
+        DATA["fees"][sid]["balance"] = max(0.0, DATA["fees"][sid]["balance"] - payment["amount"])
+        DATA["fees"][sid]["items"].append({"desc": "Online payment", "amount": -payment["amount"]})
+    save_data(DATA)
+    audit(sid, "payment_completed", {"payment_id": payment_id})
+    return jsonify({"ok": True, "payment_id": payment_id})
+
+# ---------------- Enrollment & waitlist ----------------
+@APP.route("/enroll", methods=["POST"])
+def enroll():
+    body = request.json or {}
+    student_id = body.get("student_id")
+    course_code = body.get("course_code")
+    if not student_id or not course_code:
+        abort(400, "student_id and course_code required")
+    course = DATA["courses"].get(course_code)
+    if not course:
+        abort(404, "course not found")
+
+    enrollments = DATA.setdefault("enrollments", {}).setdefault(course_code, [])
+    waitlist = DATA.setdefault("waitlists", {}).setdefault(course_code, [])
+
+    if student_id in enrollments:
+        return jsonify({"status": "already_enrolled", "course": course_code})
+    if len(enrollments) < course.get("capacity", 0):
+        enrollments.append(student_id)
+        save_data(DATA)
+        audit(student_id, "enrolled", {"course": course_code})
+        return jsonify({"status": "enrolled", "course": course_code})
     else:
-        return jsonify({"found": False, "studentId": studentId}), 404
+        if any(w.get("student_id") == student_id for w in waitlist):
+            return jsonify({"status": "already_waitlisted", "course": course_code})
+        waitlist.append({"student_id": student_id, "requested_at": now_iso()})
+        save_data(DATA)
+        audit(student_id, "waitlisted", {"course": course_code})
+        return jsonify({"status": "waitlisted", "course": course_code})
 
-@app.route("/payments/request", methods=["POST"])
-def request_payment():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    amount = data.get("amount")
-    if not studentId or amount is None:
-        return jsonify({"error": "studentId and amount required"}), 400
+@APP.route("/enroll/status/<course_code>", methods=["GET"])
+def enroll_status(course_code):
+    enrollments = DATA.get("enrollments", {}).get(course_code, [])
+    waitlist = DATA.get("waitlists", {}).get(course_code, [])
+    return jsonify({"course": course_code, "enrolled": enrollments, "waitlist": waitlist})
 
-    # Mock payment URL
-    paymentId = str(uuid.uuid4())
-    payment_url = f"https://payments.example.edu/pay/{paymentId}"
-    log_audit("request_payment", {"studentId": studentId, "amount": amount, "paymentId": paymentId})
-    return jsonify({"paymentUrl": payment_url, "paymentId": paymentId})
+# ---------------- Exam timetable & special arrangements ----------------
+@APP.route("/exam/timetable/<student_id>", methods=["GET"])
+def exam_timetable(student_id):
+    # return timetable for courses the student is enrolled in
+    student_courses = [c for c, studs in DATA.get("enrollments", {}).items() if student_id in studs]
+    timetable = {c: DATA.get("exam_timetables", {}).get(c, []) for c in student_courses}
+    audit(student_id, "view_exam_timetable")
+    return jsonify({"student_id": student_id, "timetable": timetable})
 
-# If fee record not found -> create ticket
-@app.route("/tickets/finance", methods=["POST"])
-def create_finance_ticket():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    details = data.get("details", "")
-    ticket = make_ticket(studentId, "finance", "fee_query", details)
-    return jsonify({"ticket": ticket, "message": "Ticket created for finance team."}), 201
+@APP.route("/exam/special", methods=["POST"])
+def request_special_exam():
+    body = request.json or {}
+    sid = body.get("student_id")
+    course = body.get("course_code")
+    reason = body.get("reason", "")
+    if not sid or not course:
+        abort(400, "student_id and course_code required")
+    ticket_id = str(uuid.uuid4())
+    ticket = {
+        "id": ticket_id,
+        "student_id": sid,
+        "course": course,
+        "reason": reason,
+        "status": "submitted",
+        "created": now_iso()
+    }
+    DATA.setdefault("exam_special_requests", {})[ticket_id] = ticket
+    save_data(DATA)
+    audit(sid, "special_exam_request", {"ticket_id": ticket_id})
+    return jsonify({"ticket_id": ticket_id, "status": "submitted"})
 
-# ---------- Enrollment ----------
-@app.route("/courses/<courseCode>/availability", methods=["GET"])
-def course_availability(courseCode):
-    c = courses.get(courseCode)
-    if not c:
-        return jsonify({"exists": False}), 404
-    seats_available = max(0, c["seats_total"] - c["seats_filled"])
-    return jsonify({"exists": True, "courseCode": courseCode, "seatsAvailable": seats_available})
-
-@app.route("/enrollment", methods=["POST"])
-def enroll_student():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    courseCode = data.get("courseCode")
-    if not studentId or not courseCode:
-        return jsonify({"error": "studentId and courseCode required"}), 400
-
-    student = students.get(studentId)
-    course = courses.get(courseCode)
-    log_audit("enroll_request", {"studentId": studentId, "courseCode": courseCode})
-
-    # Basic validations
-    if not student:
-        return jsonify({"error": "student not found"}), 404
-    # check holds/prereqs
-    if student.get("holds"):
-        return jsonify({"eligible": False, "reason": "student has holds: " + ",".join(student.get("holds"))}), 403
-
-    prereqs = course.get("prereqs", []) if course else []
-    # NOTE: in this mock we won't enforce prereq completion; assume passed earlier
-    seats = course["seats_total"] - course["seats_filled"]
-    if seats <= 0:
-        # add to waitlist
-        waitlists.setdefault(courseCode, []).append(studentId)
-        pos = len(waitlists[courseCode])
-        log_audit("waitlist_add", {"studentId": studentId, "courseCode": courseCode, "position": pos})
-        return jsonify({"enrolled": False, "waitlist": True, "position": pos, "message": "Added to waitlist"}), 200
-
-    # Enroll
-    course["seats_filled"] += 1
-    enrollments.setdefault(studentId, []).append(courseCode)
-    log_audit("enrolled", {"studentId": studentId, "courseCode": courseCode})
-    # Notify (mock)
-    return jsonify({"enrolled": True, "courseCode": courseCode, "message": "Enrollment successful"}), 200
-
-@app.route("/enrollment/override", methods=["POST"])
-def override_request():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    courseCode = data.get("courseCode")
-    reason = data.get("reason", "")
-    ticket = make_ticket(studentId, "academics", "override_request", {"courseCode": courseCode, "reason": reason})
-    return jsonify({"message": "Override request submitted", "ticket": ticket}), 201
-
-# ---------- Exams ----------
-@app.route("/exams/timetable", methods=["GET"])
-def get_timetable():
-    studentId = request.args.get("studentId")
-    sem = request.args.get("semester")
-    log_audit("get_timetable", {"studentId": studentId, "semester": sem})
-    if not studentId:
-        return jsonify({"error": "studentId required"}), 400
-    t = exams.get(studentId, [])
-    return jsonify({"studentId": studentId, "timetable": t})
-
-@app.route("/exams/special", methods=["POST"])
-def exams_special_request():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    reason = data.get("reason")
-    attachments = data.get("attachments", [])
-    ticket = make_ticket(studentId, "exams", "special_arrangement", {"reason": reason, "attachments": attachments})
-    return jsonify({"message": "Special arrangement request submitted", "ticket": ticket}), 201
-
-# ---------- Hostel ----------
-@app.route("/hostel/availability", methods=["GET"])
+# ---------------- Hostel booking & maintenance ----------------
+@APP.route("/hostel/availability", methods=["GET"])
 def hostel_availability():
-    block = request.args.get("block")
-    log_audit("hostel_availability", {"block": block})
-    if block:
-        avail = [r for r in hostel_rooms if r["block"] == block and r["available"]]
-    else:
-        avail = [r for r in hostel_rooms if r["available"]]
-    return jsonify({"availableRooms": avail})
+    return jsonify(DATA.get("hostels", {}))
 
-@app.route("/hostel/book", methods=["POST"])
+@APP.route("/hostel/book", methods=["POST"])
 def hostel_book():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    room = data.get("room")
-    # find room
-    for r in hostel_rooms:
-        if r["room"] == room:
-            if not r["available"]:
-                return jsonify({"error": "room not available"}), 400
-            r["available"] = False
-            booking = {"bookingId": str(uuid.uuid4()), "studentId": studentId, "room": room, "bookedAt": datetime.utcnow().isoformat()}
-            log_audit("hostel_book", booking)
-            return jsonify({"message": "Room booked", "booking": booking})
-    return jsonify({"error": "room not found"}), 404
+    body = request.json or {}
+    sid = body.get("student_id")
+    hostel_id = body.get("hostel_id")
+    if not sid or not hostel_id:
+        abort(400, "student_id and hostel_id required")
+    hostel = DATA.get("hostels", {}).get(hostel_id)
+    if not hostel:
+        abort(404, "hostel not found")
+    if hostel.get("rooms_available", 0) <= 0:
+        return jsonify({"status": "full"})
+    booking_id = str(uuid.uuid4())
+    DATA.setdefault("hostel_bookings", {})[booking_id] = {
+        "id": booking_id, "student_id": sid, "hostel_id": hostel_id, "created": now_iso()
+    }
+    hostel["rooms_available"] = max(0, hostel.get("rooms_available", 1) - 1)
+    save_data(DATA)
+    audit(sid, "hostel_booked", {"booking_id": booking_id, "hostel_id": hostel_id})
+    return jsonify({"status": "booked", "booking_id": booking_id})
 
-@app.route("/hostel/maintenance", methods=["POST"])
+@APP.route("/hostel/maintenance", methods=["POST"])
 def hostel_maintenance():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    room = data.get("room")
-    issue = data.get("issue")
-    attachments = data.get("attachments", [])
-    ticket = make_ticket(studentId, "hostel", "maintenance", {"room": room, "issue": issue, "attachments": attachments})
-    return jsonify({"message": "Maintenance ticket created", "ticket": ticket}), 201
+    body = request.json or {}
+    sid = body.get("student_id")
+    hostel_id = body.get("hostel_id")
+    desc = body.get("description", "")
+    if not sid or not hostel_id:
+        abort(400, "student_id and hostel_id required")
+    ticket_id = str(uuid.uuid4())
+    DATA.setdefault("maintenance_tickets", {})[ticket_id] = {
+        "id": ticket_id, "student_id": sid, "hostel_id": hostel_id, "description": desc,
+        "status": "open", "created": now_iso()
+    }
+    save_data(DATA)
+    audit(sid, "maintenance_ticket", {"ticket_id": ticket_id})
+    return jsonify({"ticket_id": ticket_id, "status": "open"})
 
-@app.route("/hostel/mess-complaint", methods=["POST"])
-def mess_complaint():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    date = data.get("date")
-    description = data.get("description")
-    ticket = make_ticket(studentId, "hostel", "mess_complaint", {"date": date, "description": description})
-    return jsonify({"message": "Mess complaint logged", "ticket": ticket}), 201
-
-# ---------- Leave ----------
-@app.route("/leave", methods=["POST"])
-def submit_leave():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    from_date = data.get("fromDate")
-    to_date = data.get("toDate")
-    leave_type = data.get("leaveType")
-    reason = data.get("reason", "")
-    supporting = data.get("supporting", [])
-
-    # Basic policy: auto-approve if <=2 days and not special type
+# ---------------- Leave applications with auto-approve ----------------
+@APP.route("/leave/apply", methods=["POST"])
+def leave_apply():
+    body = request.json or {}
+    sid = body.get("student_id")
+    start = body.get("start_date")
+    end = body.get("end_date")
+    reason = body.get("reason", "")
+    if not sid or not start or not end:
+        abort(400, "student_id, start_date and end_date required")
     try:
-        dfrom = datetime.fromisoformat(from_date)
-        dto = datetime.fromisoformat(to_date)
-        days = (dto - dfrom).days + 1
+        sdate = datetime.datetime.fromisoformat(start)
+        edate = datetime.datetime.fromisoformat(end)
     except Exception:
-        days = 0
+        abort(400, "dates must be ISO format YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
+    duration_days = (edate - sdate).days + 1
+    # simple auto-approve rule: <=3 days and reason provided
+    status = "approved" if (duration_days <= 3 and reason) else "pending"
+    lr_id = str(uuid.uuid4())
+    DATA.setdefault("leave_requests", {})[lr_id] = {
+        "id": lr_id, "student_id": sid, "start": start, "end": end,
+        "reason": reason, "status": status, "created": now_iso()
+    }
+    save_data(DATA)
+    audit(sid, "leave_applied", {"leave_id": lr_id, "status": status})
+    return jsonify({"leave_id": lr_id, "status": status, "duration_days": duration_days})
 
-    record = {"leaveId": str(uuid.uuid4()), "studentId": studentId, "from": from_date, "to": to_date, "type": leave_type, "reason": reason, "status": "pending", "submittedAt": datetime.utcnow().isoformat()}
-    if days <= 2 and leave_type.lower() not in ("maternity", "medical"):
-        record["status"] = "approved"
-        message = "Auto-approved"
-    else:
-        # create ticket for approver
-        make_ticket(studentId, "academics", "leave_approval", {"leave": record})
-        message = "Submitted for approval"
-
-    leaves.append(record)
-    log_audit("leave_submitted", record)
-    return jsonify({"leave": record, "message": message}), 201
-
-# ---------- Events ----------
-@app.route("/events/<eventId>/register", methods=["POST"])
-def register_event(eventId):
-    data = request.json or {}
-    studentId = data.get("studentId")
-    role = data.get("role", "participant")
-    event = events.get(eventId)
+# ---------------- Events registration & waitlist ----------------
+@APP.route("/events/register", methods=["POST"])
+def event_register():
+    body = request.json or {}
+    sid = body.get("student_id")
+    event_id = body.get("event_id")
+    if not sid or not event_id:
+        abort(400, "student_id and event_id required")
+    event = DATA.get("events", {}).get(event_id)
     if not event:
-        return jsonify({"error": "event not found"}), 404
-
-    # check capacity
-    cap = event["capacity"]
-    if len(event["participants"]) < cap:
-        event["participants"].append({"studentId": studentId, "role": role, "registeredAt": datetime.utcnow().isoformat()})
-        log_audit("event_register", {"eventId": eventId, "studentId": studentId})
-        # generate simple ticket/qr placeholder
-        confirmation = {"eventId": eventId, "studentId": studentId, "ticketQRCode": f"QR-{str(uuid.uuid4())[:8]}"}
-        return jsonify({"registered": True, "confirmation": confirmation}), 200
+        abort(404, "event not found")
+    regs = DATA.setdefault("event_registrations", {}).setdefault(event_id, [])
+    if sid in regs:
+        return jsonify({"status": "already_registered"})
+    if len(regs) < event.get("capacity", 0):
+        regs.append(sid)
+        save_data(DATA)
+        audit(sid, "event_registered", {"event_id": event_id})
+        return jsonify({"status": "registered"})
     else:
-        event["waitlist"].append(studentId)
-        pos = len(event["waitlist"])
-        log_audit("event_waitlist_add", {"eventId": eventId, "studentId": studentId, "position": pos})
-        return jsonify({"registered": False, "waitlistPosition": pos, "message": "Event full, added to waitlist"}), 200
+        wl = DATA.setdefault("event_waitlists", {}).setdefault(event_id, [])
+        wl.append({"student_id": sid, "requested_at": now_iso()})
+        save_data(DATA)
+        audit(sid, "event_waitlisted", {"event_id": event_id})
+        return jsonify({"status": "waitlisted"})
 
-# ---------- Identity verification (OTP simulation) ----------
-otp_store = {}
-@app.route("/verify_identity", methods=["POST"])
-def verify_identity():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    method = data.get("method", "otp")  # otp or sso
-    if method == "sso":
-        # Simulate SSO success
-        log_audit("verify_sso", {"studentId": studentId})
-        return jsonify({"verified": True, "method": "sso"}), 200
+# ---------------- OTP identity verification ----------------
+@APP.route("/verify/otp/request", methods=["POST"])
+def request_otp():
+    body = request.json or {}
+    sid = body.get("student_id")
+    if not sid:
+        abort(400, "student_id required")
+    code = str(uuid.uuid4())[:6]
+    exp = (datetime.datetime.utcnow() + datetime.timedelta(minutes=5)).replace(microsecond=0).isoformat() + "Z"
+    DATA.setdefault("otps", {})[sid] = {"code": code, "expires_at": exp}
+    save_data(DATA)
+    audit(sid, "otp_requested")
+    # for testing we return the code (in production you'd send via SMS/email)
+    return jsonify({"student_id": sid, "otp": code, "expires_at": exp})
 
-    # OTP flow - generate
-    code = str(uuid.uuid4())[:6].upper()
-    otp_store[studentId] = {"code": code, "expires": (datetime.utcnow() + timedelta(minutes=5)).isoformat()}
-    # In real life: send SMS or email. Here we return the code so you can test in Postman.
-    log_audit("otp_generated", {"studentId": studentId, "otp": code})
-    return jsonify({"sent": True, "otp": code, "note": "OTP returned in response for testing only"}), 200
-
-@app.route("/verify_identity/confirm", methods=["POST"])
-def verify_identity_confirm():
-    data = request.json or {}
-    studentId = data.get("studentId")
-    code = data.get("code")
-    rec = otp_store.get(studentId)
+@APP.route("/verify/otp/confirm", methods=["POST"])
+def confirm_otp():
+    body = request.json or {}
+    sid = body.get("student_id")
+    code = body.get("otp")
+    if not sid or not code:
+        abort(400, "student_id and otp required")
+    rec = DATA.get("otps", {}).get(sid)
     if not rec:
-        return jsonify({"verified": False, "reason": "no otp generated"}), 400
-    if rec["code"] == code:
-        log_audit("otp_verified", {"studentId": studentId})
-        return jsonify({"verified": True}), 200
-    return jsonify({"verified": False, "reason": "invalid code"}), 400
+        return jsonify({"verified": False, "reason": "no_otp_requested"}), 400
+    # compare code and expiration
+    if rec.get("code") != code:
+        return jsonify({"verified": False, "reason": "invalid_code"}), 400
+    if datetime.datetime.fromisoformat(rec["expires_at"].replace("Z", "")) < datetime.datetime.utcnow():
+        return jsonify({"verified": False, "reason": "expired"}), 400
+    DATA["otps"].pop(sid, None)
+    save_data(DATA)
+    audit(sid, "otp_verified")
+    return jsonify({"verified": True})
 
-# ---------- Tickets & audit ----------
-@app.route("/tickets", methods=["GET"])
-def list_tickets():
-    return jsonify({"tickets": tickets})
-
-@app.route("/audit/logs", methods=["GET"])
+# ---------------- Audit logs & helpers ----------------
+@APP.route("/audit/logs", methods=["GET"])
 def get_audit_logs():
-    return jsonify({"logs": audit_logs})
+    since = request.args.get("since")
+    logs = DATA.get("audit_logs", [])
+    if since:
+        try:
+            sdt = datetime.datetime.fromisoformat(since.replace("Z", ""))
+            logs = [l for l in logs if datetime.datetime.fromisoformat(l["time"].replace("Z", "")) >= sdt]
+        except Exception:
+            pass
+    return jsonify({"count": len(logs), "logs": logs})
 
-# ---------- Serve uploaded flow image ----------
-@app.route("/assets/flow_image", methods=["GET"])
-def serve_flow_image():
-    try:
-        return send_file(FLOW_IMAGE_PATH, mimetype='image/png')
-    except Exception as e:
-        return jsonify({"error": "could not find image", "path": FLOW_IMAGE_PATH, "exception": str(e)}), 404
+@APP.route("/students/<student_id>", methods=["GET"])
+def get_student(student_id):
+    s = DATA.get("students", {}).get(student_id)
+    if not s:
+        abort(404)
+    return jsonify(s)
 
-# -------------------------
-# Run
-# -------------------------
+@APP.route("/courses", methods=["GET"])
+def list_courses():
+    return jsonify(list(DATA.get("courses", {}).values()))
+
+@APP.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": now_iso()})
+
+# admin testing - reload from disk (dev only)
+@APP.route("/admin/reset", methods=["POST"])
+def admin_reset():
+    global DATA
+    DATA = load_data()
+    audit("admin", "reset")
+    return jsonify({"ok": True})
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # Allow port override via env var
+    port = int(os.environ.get("PORT", 5000))
+    APP.run(host="0.0.0.0", port=port, debug=True)
